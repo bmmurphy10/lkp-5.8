@@ -145,7 +145,7 @@ static int call_usermodehelper_exec_async_dupe(void *data)
 	 */
 	set_user_nice(current, 0);
 
-	if ((retval = cgroup_attach_task_all(sub_info->curr, curr)) != 0)
+	if ((retval = cgroup_attach_task_all(sub_info->curr, current)) != 0)
 		goto out;
 
 	retval = -ENOMEM;
