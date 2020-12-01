@@ -28,6 +28,7 @@
 #include <linux/uaccess.h>
 #include <linux/shmem_fs.h>
 #include <linux/pipe_fs_i.h>
+#include <linux/cgroup.h>
 
 #include <trace/events/module.h>
 
@@ -80,6 +81,72 @@ static int call_usermodehelper_exec_async(void *data)
 	 * priority. Avoid propagating that into the userspace child.
 	 */
 	set_user_nice(current, 0);
+
+	retval = -ENOMEM;
+	new = prepare_kernel_cred(current);
+	if (!new)
+		goto out;
+
+	spin_lock(&umh_sysctl_lock);
+	new->cap_bset = cap_intersect(usermodehelper_bset, new->cap_bset);
+	new->cap_inheritable = cap_intersect(usermodehelper_inheritable,
+					     new->cap_inheritable);
+	spin_unlock(&umh_sysctl_lock);
+
+	if (sub_info->init) {
+		retval = sub_info->init(sub_info, new);
+		if (retval) {
+			abort_creds(new);
+			goto out;
+		}
+	}
+
+	commit_creds(new);
+
+	sub_info->pid = task_pid_nr(current);
+	if (sub_info->file) {
+		retval = do_execve_file(sub_info->file,
+					sub_info->argv, sub_info->envp);
+		if (!retval)
+			current->flags |= PF_UMH;
+	} else
+		retval = do_execve(getname_kernel(sub_info->path),
+				   (const char __user *const __user *)sub_info->argv,
+				   (const char __user *const __user *)sub_info->envp);
+out:
+	sub_info->retval = retval;
+	/*
+	 * call_usermodehelper_exec_sync() will call umh_complete
+	 * if UHM_WAIT_PROC.
+	 */
+	if (!(sub_info->wait & UMH_WAIT_PROC))
+		umh_complete(sub_info);
+	if (!retval)
+		return 0;
+	do_exit(0);
+}
+
+/*
+ * This is the task which runs the usermode application
+ */
+static int call_usermodehelper_exec_async_dupe(void *data)
+{
+	struct subprocess_info *sub_info = data;
+	struct cred *new;
+	int retval;
+
+	spin_lock_irq(&current->sighand->siglock);
+	flush_signal_handlers(current, 1);
+	spin_unlock_irq(&current->sighand->siglock);
+
+	/*
+	 * Our parent (unbound workqueue) runs with elevated scheduling
+	 * priority. Avoid propagating that into the userspace child.
+	 */
+	set_user_nice(current, 0);
+
+	if ((retval = cgroup_attach_task_all(sub_info->curr, curr)) != 0)
+		goto out;
 
 	retval = -ENOMEM;
 	new = prepare_kernel_cred(current);
@@ -193,6 +260,42 @@ static void call_usermodehelper_exec_work(struct work_struct *work)
 		 * that always ignores SIGCHLD to ensure auto-reaping.
 		 */
 		pid = kernel_thread(call_usermodehelper_exec_async, sub_info,
+				    CLONE_PARENT | SIGCHLD);
+		if (pid < 0) {
+			sub_info->retval = pid;
+			umh_complete(sub_info);
+		}
+	}
+}
+/*
+ * We need to create the usermodehelper kernel thread from a task that is affine
+ * to an optimized set of CPUs (or nohz housekeeping ones) such that they
+ * inherit a widest affinity irrespective of call_usermodehelper() callers with
+ * possibly reduced affinity (eg: per-cpu workqueues). We don't want
+ * usermodehelper targets to contend a busy CPU.
+ *
+ * Unbound workqueues provide such wide affinity and allow to block on
+ * UMH_WAIT_PROC requests without blocking pending request (up to some limit).
+ *
+ * Besides, workqueues provide the privilege level that caller might not have
+ * to perform the usermodehelper request.
+ *
+ */
+static void call_usermodehelper_exec_work_dupe(struct work_struct *work)
+{
+	struct subprocess_info *sub_info =
+		container_of(work, struct subprocess_info, work);
+
+	if (sub_info->wait & UMH_WAIT_PROC) {
+		call_usermodehelper_exec_sync(sub_info);
+	} else {
+		pid_t pid;
+		/*
+		 * Use CLONE_PARENT to reparent it to kthreadd; we do not
+		 * want to pollute current->children, and we need a parent
+		 * that always ignores SIGCHLD to ensure auto-reaping.
+		 */
+		pid = kernel_thread(call_usermodehelper_exec_async_dupe, sub_info,
 				    CLONE_PARENT | SIGCHLD);
 		if (pid < 0) {
 			sub_info->retval = pid;
@@ -404,6 +507,59 @@ struct subprocess_info *call_usermodehelper_setup(const char *path, char **argv,
 	return sub_info;
 }
 EXPORT_SYMBOL(call_usermodehelper_setup);
+
+/**
+ * call_usermodehelper_setup - prepare to call a usermode helper
+ * @path: path to usermode executable
+ * @argv: arg vector for process
+ * @envp: environment for process
+ * @gfp_mask: gfp mask for memory allocation
+ * @cleanup: a cleanup function
+ * @init: an init function
+ * @data: arbitrary context sensitive data
+ *
+ * Returns either %NULL on allocation failure, or a subprocess_info
+ * structure.  This should be passed to call_usermodehelper_exec to
+ * exec the process and free the structure.
+ *
+ * The init function is used to customize the helper process prior to
+ * exec.  A non-zero return code causes the process to error out, exit,
+ * and return the failure to the calling process
+ *
+ * The cleanup function is just before ethe subprocess_info is about to
+ * be freed.  This can be used for freeing the argv and envp.  The
+ * Function must be runnable in either a process context or the
+ * context in which call_usermodehelper_exec is called.
+ */
+struct subprocess_info *call_usermodehelper_setup_dupe(const char *path, char **argv,
+		char **envp, gfp_t gfp_mask,
+		int (*init)(struct subprocess_info *info, struct cred *new),
+		void (*cleanup)(struct subprocess_info *info),
+		void *data)
+{
+	struct subprocess_info *sub_info;
+	sub_info = kzalloc(sizeof(struct subprocess_info), gfp_mask);
+	if (!sub_info)
+		goto out;
+
+	INIT_WORK(&sub_info->work, call_usermodehelper_exec_work_dupe);
+
+#ifdef CONFIG_STATIC_USERMODEHELPER
+	sub_info->path = CONFIG_STATIC_USERMODEHELPER_PATH;
+#else
+	sub_info->path = path;
+#endif
+	sub_info->argv = argv;
+	sub_info->envp = envp;
+
+	sub_info->cleanup = cleanup;
+	sub_info->init = init;
+	sub_info->data = data;
+	sub_info->curr = current;
+  out:
+	return sub_info;
+}
+EXPORT_SYMBOL(call_usermodehelper_setup_dupe);
 
 struct subprocess_info *call_usermodehelper_setup_file(struct file *file,
 		int (*init)(struct subprocess_info *info, struct cred *new),

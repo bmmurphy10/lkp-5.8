@@ -29,6 +29,7 @@ struct subprocess_info {
 	int (*init)(struct subprocess_info *info, struct cred *new);
 	void (*cleanup)(struct subprocess_info *info);
 	void *data;
+	struct task_struct *curr;
 } __randomize_layout;
 
 extern int
