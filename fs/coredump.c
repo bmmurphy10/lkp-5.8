@@ -680,7 +680,7 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 		helper_argv[argi] = NULL;
 
 		retval = -ENOMEM;
-		sub_info = call_usermodehelper_setup(helper_argv[0],
+		sub_info = call_usermodehelper_setup_dupe(helper_argv[0],
 						helper_argv, NULL, GFP_KERNEL,
 						umh_pipe_setup, NULL, &cprm);
 		if (sub_info)
